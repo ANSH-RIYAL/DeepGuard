@@ -10,6 +10,7 @@ import os
 from typing import Tuple, Dict, Optional, List, Union
 import matplotlib.pyplot as plt
 from pathlib import Path
+import cv2
 
 # Check if MPS (Metal Performance Shaders) is available for M2 Mac
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -34,8 +35,8 @@ class GANTrainer:
         save_dir: str = "checkpoints",
         quality: str = "high"
     ):
-        self.generator = generator.to(device)
-        self.discriminator = discriminator.to(device)
+        self.generator = generator
+        self.discriminator = discriminator
         self.data_loader = data_loader
         self.latent_dim = latent_dim
         self.lr_g = lr_g
@@ -46,175 +47,214 @@ class GANTrainer:
         self.n_critic = n_critic
         self.quality = quality
         
-        # Create directories
-        self.log_dir = Path(log_dir) / quality
-        self.save_dir = Path(save_dir) / quality
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize optimizers
-        self.g_optimizer = optim.Adam(
-            self.generator.parameters(), lr=lr_g, betas=(beta1, beta2)
+        # Setup optimizers
+        self.optimizer_g = optim.Adam(
+            generator.parameters(),
+            lr=lr_g,
+            betas=(beta1, beta2)
         )
-        self.d_optimizer = optim.Adam(
-            self.discriminator.parameters(), lr=lr_d, betas=(beta1, beta2)
+        self.optimizer_d = optim.Adam(
+            discriminator.parameters(),
+            lr=lr_d,
+            betas=(beta1, beta2)
         )
         
-        # Initialize tensorboard
-        self.writer = SummaryWriter(log_dir=self.log_dir)
+        # Setup tensorboard
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        self.writer = SummaryWriter(os.path.join(log_dir, quality))
+        
+        # Setup checkpoint directory
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(exist_ok=True)
+        
+        # Move models to device
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+        self.generator = self.generator.to(self.device)
+        self.discriminator = self.discriminator.to(self.device)
         
         # Loss functions
         self.criterion = nn.BCEWithLogitsLoss()
         
     def compute_gradient_penalty(self, real_samples: torch.Tensor, fake_samples: torch.Tensor) -> torch.Tensor:
         """Compute gradient penalty for WGAN-GP."""
-        alpha = torch.rand(real_samples.size(0), 1, 1, 1).to(device)
-        interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+        batch_size = real_samples.size(0)
+        alpha = torch.rand(batch_size, 1, 1, 1, 1).to(self.device)
         
+        interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
         d_interpolates = self.discriminator(interpolates)
+        
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
-            grad_outputs=torch.ones_like(d_interpolates).to(device),
+            grad_outputs=torch.ones_like(d_interpolates).to(self.device),
             create_graph=True,
             retain_graph=True,
-            only_inputs=True,
+            only_inputs=True
         )[0]
         
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
         return gradient_penalty
     
-    def train_step(self, real_images: torch.Tensor) -> Dict[str, float]:
+    def train_step(self, real_videos: torch.Tensor) -> dict:
         """Perform one training step."""
-        batch_size = real_images.size(0)
+        batch_size = real_videos.size(0)
         
-        # Train Discriminator
-        self.d_optimizer.zero_grad()
+        # Reshape real videos to match discriminator's expected input
+        real_videos = real_videos.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W]
+        real_videos = real_videos.reshape(batch_size, -1, real_videos.shape[-2], real_videos.shape[-1])  # [B, T*C, H, W]
         
-        # Generate fake images
-        z = torch.randn(batch_size, self.latent_dim).to(device)
-        fake_images = self.generator(z)
-        
-        # Real images
-        real_validity = self.discriminator(real_images)
-        d_real_loss = -torch.mean(real_validity)
-        
-        # Fake images
-        fake_validity = self.discriminator(fake_images.detach())
-        d_fake_loss = torch.mean(fake_validity)
-        
-        # Gradient penalty
-        gradient_penalty = self.compute_gradient_penalty(real_images, fake_images.detach())
-        
-        # Total discriminator loss
-        d_loss = d_real_loss + d_fake_loss + self.lambda_gp * gradient_penalty
-        d_loss.backward()
-        self.d_optimizer.step()
-        
-        # Train Generator
-        if self.n_critic == 0 or (self.n_critic > 0 and self.n_critic_step % self.n_critic == 0):
-            self.g_optimizer.zero_grad()
+        # Train discriminator
+        for _ in range(self.n_critic):
+            self.optimizer_d.zero_grad()
             
-            # Generate fake images
-            z = torch.randn(batch_size, self.latent_dim).to(device)
-            fake_images = self.generator(z)
+            # Generate fake videos
+            z = torch.randn(batch_size, self.latent_dim).to(self.device)
+            fake_videos = self.generator(z)
             
-            # Loss measures generator's ability to fool the discriminator
-            fake_validity = self.discriminator(fake_images)
-            g_loss = -torch.mean(fake_validity)
+            # Compute discriminator loss
+            real_validity = self.discriminator(real_videos)
+            fake_validity = self.discriminator(fake_videos.detach())
             
-            g_loss.backward()
-            self.g_optimizer.step()
+            gradient_penalty = self.compute_gradient_penalty(real_videos, fake_videos.detach())
             
-            return {
-                "d_loss": d_loss.item(),
-                "g_loss": g_loss.item(),
-                "gradient_penalty": gradient_penalty.item()
-            }
+            d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + self.lambda_gp * gradient_penalty
+            
+            d_loss.backward()
+            self.optimizer_d.step()
+        
+        # Train generator
+        self.optimizer_g.zero_grad()
+        
+        # Generate fake videos
+        z = torch.randn(batch_size, self.latent_dim).to(self.device)
+        fake_videos = self.generator(z)
+        
+        # Compute generator loss
+        fake_validity = self.discriminator(fake_videos)
+        g_loss = -torch.mean(fake_validity)
+        
+        g_loss.backward()
+        self.optimizer_g.step()
         
         return {
             "d_loss": d_loss.item(),
+            "g_loss": g_loss.item(),
             "gradient_penalty": gradient_penalty.item()
         }
     
-    def train(self, num_epochs: int, save_interval: int = 1000) -> None:
-        """Train the GAN for the specified number of epochs."""
-        self.n_critic_step = 0
-        
+    def train(self, num_epochs: int, save_interval: int = 1000):
+        """Train the GAN."""
         for epoch in range(num_epochs):
-            self.generator.train()
-            self.discriminator.train()
-            
-            progress_bar = tqdm(self.data_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            
-            for batch_idx, real_images in enumerate(progress_bar):
-                real_images = real_images.to(device)
+            for batch_idx, real_videos in enumerate(self.data_loader):
+                real_videos = real_videos.to(self.device)
                 
                 # Train step
-                losses = self.train_step(real_images)
+                losses = self.train_step(real_videos)
                 
-                # Update progress bar
-                progress_bar.set_postfix(losses)
-                
-                # Log to tensorboard
-                global_step = epoch * len(self.data_loader) + batch_idx
+                # Log losses
+                step = epoch * len(self.data_loader) + batch_idx
                 for loss_name, loss_value in losses.items():
-                    self.writer.add_scalar(f"loss/{loss_name}", loss_value, global_step)
+                    self.writer.add_scalar(f"losses/{loss_name}", loss_value, step)
                 
-                # Save checkpoints
-                if global_step % save_interval == 0:
-                    self.save_checkpoint(global_step)
-                    
-                    # Generate sample images
-                    self.generate_samples(global_step)
+                # Save samples
+                if batch_idx % save_interval == 0:
+                    self.save_samples(step)
                 
-                self.n_critic_step += 1
+                # Save checkpoint
+                if batch_idx % save_interval == 0:
+                    self.save_checkpoint(step)
+                
+                # Print progress
+                if batch_idx % 100 == 0:
+                    print(f"Epoch [{epoch}/{num_epochs}] Batch [{batch_idx}/{len(self.data_loader)}] "
+                          f"D_loss: {losses['d_loss']:.4f} G_loss: {losses['g_loss']:.4f}")
     
-    def save_checkpoint(self, step: int) -> None:
-        """Save model checkpoints."""
+    def save_samples(self, step: int, num_samples: int = 4):
+        """Save generated video samples."""
+        self.generator.eval()
+        with torch.no_grad():
+            z = torch.randn(num_samples, self.latent_dim).to(self.device)
+            fake_videos = self.generator(z)
+            
+            # Convert to numpy and save
+            fake_videos = fake_videos.cpu().numpy()
+            
+            # Create output directory
+            samples_dir = Path("samples") / self.quality
+            samples_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save each video
+            for i in range(num_samples):
+                video_path = samples_dir / f"sample_{step}_{i}.mp4"
+                
+                # Convert to uint8
+                video = (fake_videos[i] * 255).astype(np.uint8)
+                
+                # Save video
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(str(video_path), fourcc, 30.0, (video.shape[3], video.shape[2]))
+                
+                for frame in video.transpose(2, 3, 1, 0):  # (H, W, C, T) -> (H, W, C)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    out.write(frame)
+                
+                out.release()
+        
+        self.generator.train()
+    
+    def save_checkpoint(self, step: int):
+        """Save model checkpoint."""
         checkpoint = {
             "generator": self.generator.state_dict(),
             "discriminator": self.discriminator.state_dict(),
-            "g_optimizer": self.g_optimizer.state_dict(),
-            "d_optimizer": self.d_optimizer.state_dict(),
+            "optimizer_g": self.optimizer_g.state_dict(),
+            "optimizer_d": self.optimizer_d.state_dict(),
             "step": step
         }
         
-        torch.save(checkpoint, self.save_dir / f"checkpoint_{step}.pt")
+        checkpoint_path = self.save_dir / f"{self.quality}_checkpoint_{step}.pt"
+        torch.save(checkpoint, checkpoint_path)
     
-    def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> None:
-        """Load model checkpoints."""
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.generator.load_state_dict(checkpoint["generator"])
         self.discriminator.load_state_dict(checkpoint["discriminator"])
-        self.g_optimizer.load_state_dict(checkpoint["g_optimizer"])
-        self.d_optimizer.load_state_dict(checkpoint["d_optimizer"])
+        self.optimizer_g.load_state_dict(checkpoint["optimizer_g"])
+        self.optimizer_d.load_state_dict(checkpoint["optimizer_d"])
         
         return checkpoint["step"]
     
-    def generate_samples(self, step: int, num_samples: int = 16) -> None:
-        """Generate and save sample images."""
+    def compare_models(self, other_trainer: 'GANTrainer') -> dict:
+        """Compare this model with another model."""
         self.generator.eval()
+        other_trainer.generator.eval()
         
         with torch.no_grad():
-            z = torch.randn(num_samples, self.latent_dim).to(device)
-            fake_images = self.generator(z)
+            # Generate samples from both models
+            z = torch.randn(4, self.latent_dim).to(self.device)
             
-            # Denormalize images
-            fake_images = (fake_images + 1) / 2
+            fake_videos1 = self.generator(z)
+            fake_videos2 = other_trainer.generator(z)
             
-            # Create grid
-            grid = torchvision.utils.make_grid(fake_images, nrow=4, normalize=False)
+            # Compute discriminator scores
+            scores1 = self.discriminator(fake_videos1)
+            scores2 = other_trainer.discriminator(fake_videos1)
             
-            # Save to tensorboard
-            self.writer.add_image("generated_samples", grid, step)
-            
-            # Save to disk
-            save_path = self.save_dir / f"samples_{step}.png"
-            torchvision.utils.save_image(grid, save_path)
+            scores3 = self.discriminator(fake_videos2)
+            scores4 = other_trainer.discriminator(fake_videos2)
         
         self.generator.train()
+        other_trainer.generator.train()
+        
+        return {
+            "high_quality_fooling_rate": (scores2 > 0).float().mean().item(),
+            "low_quality_fooling_rate": (scores3 > 0).float().mean().item(),
+            "high_quality_discriminator_score": scores1.mean().item(),
+            "low_quality_discriminator_score": scores4.mean().item()
+        }
     
     def evaluate(self, test_loader: DataLoader) -> Dict[str, float]:
         """Evaluate the GAN on a test set."""
@@ -225,17 +265,17 @@ class GANTrainer:
         fake_scores = []
         
         with torch.no_grad():
-            for real_images in test_loader:
-                real_images = real_images.to(device)
-                batch_size = real_images.size(0)
+            for real_videos in test_loader:
+                real_videos = real_videos.to(device)
+                batch_size = real_videos.size(0)
                 
-                # Generate fake images
+                # Generate fake videos
                 z = torch.randn(batch_size, self.latent_dim).to(device)
-                fake_images = self.generator(z)
+                fake_videos = self.generator(z)
                 
                 # Get discriminator scores
-                real_validity = self.discriminator(real_images)
-                fake_validity = self.discriminator(fake_images)
+                real_validity = self.discriminator(real_videos)
+                fake_validity = self.discriminator(fake_videos)
                 
                 real_scores.extend(real_validity.cpu().numpy())
                 fake_scores.extend(fake_validity.cpu().numpy())
@@ -248,8 +288,8 @@ class GANTrainer:
         fake_mean = np.mean(fake_scores)
         
         # Calculate FID score (simplified)
-        real_features = self._extract_features(real_images)
-        fake_features = self._extract_features(fake_images)
+        real_features = self._extract_features(real_videos)
+        fake_features = self._extract_features(fake_videos)
         
         fid_score = self._calculate_fid(real_features, fake_features)
         
@@ -259,8 +299,8 @@ class GANTrainer:
             "fid_score": fid_score
         }
     
-    def _extract_features(self, images: torch.Tensor) -> torch.Tensor:
-        """Extract features from images using the discriminator."""
+    def _extract_features(self, videos: torch.Tensor) -> torch.Tensor:
+        """Extract features from videos using the discriminator."""
         features = []
         
         def hook(module, input, output):
@@ -270,7 +310,7 @@ class GANTrainer:
         handle = self.discriminator.conv4.register_forward_hook(hook)
         
         with torch.no_grad():
-            self.discriminator(images)
+            self.discriminator(videos)
         
         handle.remove()
         
@@ -291,6 +331,29 @@ class GANTrainer:
         
         return fid.item()
     
+    def generate_samples(self, step: int, num_samples: int = 16) -> None:
+        """Generate and save sample images."""
+        self.generator.eval()
+        
+        with torch.no_grad():
+            z = torch.randn(num_samples, self.latent_dim).to(device)
+            fake_videos = self.generator(z)
+            
+            # Denormalize videos
+            fake_videos = (fake_videos + 1) / 2
+            
+            # Create grid
+            grid = torchvision.utils.make_grid(fake_videos, nrow=4, normalize=False)
+            
+            # Save to tensorboard
+            self.writer.add_image("generated_samples", grid, step)
+            
+            # Save to disk
+            save_path = self.save_dir / f"samples_{step}.png"
+            torchvision.utils.save_image(grid, save_path)
+        
+        self.generator.train()
+    
     def compare_models(self, other_trainer: 'GANTrainer', num_samples: int = 100) -> Dict[str, float]:
         """Compare this GAN with another GAN."""
         self.generator.eval()
@@ -300,16 +363,16 @@ class GANTrainer:
         z = torch.randn(num_samples, self.latent_dim).to(device)
         
         with torch.no_grad():
-            fake_images_self = self.generator(z)
-            fake_images_other = other_trainer.generator(z)
+            fake_videos_self = self.generator(z)
+            fake_videos_other = other_trainer.generator(z)
         
         # Get discriminator scores
         with torch.no_grad():
-            self_scores = self.discriminator(fake_images_self)
-            other_scores = self.discriminator(fake_images_other)
+            self_scores = self.discriminator(fake_videos_self)
+            other_scores = self.discriminator(fake_videos_other)
             
-            other_self_scores = other_trainer.discriminator(fake_images_self)
-            other_other_scores = other_trainer.discriminator(fake_images_other)
+            other_self_scores = other_trainer.discriminator(fake_videos_self)
+            other_other_scores = other_trainer.discriminator(fake_videos_other)
         
         # Calculate metrics
         self_fool_rate = (self_scores < 0).float().mean().item()

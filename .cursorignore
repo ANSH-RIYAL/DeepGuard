@@ -1,0 +1,20 @@
+# checkpoints
+checkpoints/
+
+# logs
+logs/
+
+#pycache
+__pycache__/
+
+#venv
+venv/
+
+# Any other big files bad for indexing
+*.mp4
+*.avi
+*.mov
+*.flv
+*.wmv
+*.mkv
+*.webm
